@@ -14,14 +14,13 @@ class JeekdbError(Exception):
     pass
 
 
-ExecuteResult = namedtuple('ExecuteResult', ['last_row_id'], ['row_count'])
+ExecuteResult = namedtuple('ExecuteResult', ['last_row_id', 'row_count', 'rows'])
 
 
-class Connection(object):
+class Jeekdb(object):
     """wrapper around mysql.connector.MySQLConnection"""
 
-    def __init__(self, host, port, user, password, database, connection_timeout=5,
-                 max_idle_time=3 * 60, **kwargs):
+    def __init__(self, host, port, user, password, database, max_idle_time=3 * 60, **kwargs):
         """
         init a connection, a connection will be reconnect after max_idle_time
         :param kwargs: arguments for mysql.connector
@@ -31,14 +30,13 @@ class Connection(object):
         self._last_use_time = time.time()
         self._db = None
         self._db_args = dict(
-            host=host, port=port, user=user, password=password, database=database,
-            connection_timeout=connection_timeout, autocommit=True, raise_on_warnings=True,
-            **kwargs)
+            host=host, port=port, user=user, password=password, database=database, autocommit=True,
+            raise_on_warnings=True, **kwargs)
         try:
             self.reconnect()
         except Exception as e:
             logging.error('failed to connect %s:%d %s %s', host, port, database, e, exc_info=True)
-            raise e
+            raise JeekdbError('connection failed: {}'.format(e))
 
     def __del__(self):
         self.close()
@@ -56,6 +54,7 @@ class Connection(object):
         """
         close the existing connection and re-open it
         """
+        logging.debug('Jeekdb reconnect')
         self.close()
         self._db = mysql.connector.connect(**self._db_args)
 
@@ -70,7 +69,8 @@ class Connection(object):
         self._ensure_connected()
         return self._db.cursor(dictionary=True)
 
-    def _execute(self, cursor, sql, parameter_dict=None):
+    @staticmethod
+    def _execute(cursor, sql, parameter_dict=None):
         """
         wrap cursor.execute(). parameter_dict is a dict.
         :param cursor:
@@ -86,8 +86,7 @@ class Connection(object):
         except mysql.connector.Error as e:
             logging.error("_execute failed, query=%s, parameter_dict=%s, error=%s",
                           sql, parameter_dict, e, exc_info=True)
-            self.close()
-            raise e
+            raise JeekdbError('_execute failed: {}'.format(e))
 
     def iter(self, sql, parameter_dict=None, size=20):
         """
@@ -166,8 +165,48 @@ class Connection(object):
             self._execute(cursor, sql, parameter_dict)
             last_row_id = cursor.lastrowid
             row_count = cursor.rowcount
-            return ExecuteResult(last_row_id=last_row_id, row_count=row_count)
+            rows = None
+            if cursor.with_rows:
+                rows = cursor.fetchall()
+            return ExecuteResult(last_row_id=last_row_id, row_count=row_count, rows=rows)
         finally:
             cursor.close()
 
-    update = delete = insert = execute
+    def insert(self, table, data):
+        """
+        insert a record
+        :param table: table name
+        :param data: dict, e.g. {'name': 'tom', 'age': 14}
+        :return: ExecuteResult
+        """
+        sql = "INSERT INTO `%s` (%s) VALUES (%s)"
+        sql_cols, sql_vals = [], []
+        for name, val in data.items():
+            sql_cols.append('`%s`' % name)
+            sql_vals.append('%%(%s)s' % name)
+        sql_cols = ', '.join(sql_cols)
+        sql_vals = ', '.join(sql_vals)
+        sql = sql % (table, sql_cols, sql_vals)
+        return self.execute(sql, data)
+
+    def delete(self, table, conditions):
+        """
+        delete records. Example:
+            table = 'mytable'
+            conditions = {'name': 'tom'}
+        :param table:
+        :param conditions: dict of WHERE condition, can not be {} to prevent mistaken deleting
+        :return: ExecuteResult
+        """
+        if not conditions:
+            raise JeekdbError('conditions can not be None or {}')
+        sql_where = []
+        sql_start = "DELETE FROM `%s` WHERE " % table
+        for name, val in conditions.items():
+            sql_where.append("`{0}` = %({1})s".format(name, name))
+        sql_where = ' AND '.join(sql_where)
+        sql = sql_start + sql_where
+        return self.execute(sql, conditions)
+
+    update = execute
+
